@@ -5,7 +5,18 @@ Runs the evoformer ONCE with IG, caches representations, then runs the
 structure module N times with stochastically masked representations.
 Produces distributions over coordinates, pLDDT, and PAE.
 All operations are vectorized / JAX-parallelized where possible.
+The full AlphaFold model's Haiku params have keys prefixed with
+'alphafold/alphafold_iteration/' (e.g. 'alphafold/alphafold_iteration/
+structure_module/single_layer_norm'). When we create a standalone
+hk.transform for just the structure module + heads, the module names
+start from root (e.g. 'structure_module/single_layer_norm'). This
+causes "Unable to retrieve parameter" errors.
+FIX: Extract sub-params and strip the prefix before calling sm_apply.
+Also fixes:
+  - jax.errors.JaxRuntimeError (doesn't exist in older JAX versions)
+  - Radius unification between Task 2 and Task 4
 """
+import haiku as hk
 import os
 import numpy as np
 import jax
@@ -279,6 +290,119 @@ def build_structure_only_fn(config: Any):
 # ─────────────────────────────────────────────────────────────────────
 # Phase D (continued): Batched Structure Module over N Samples
 # ─────────────────────────────────────────────────────────────────────
+def extract_sm_params(full_params: dict) -> dict:
+    """Extract structure module + confidence head params from full model.
+    The full model's Haiku params have keys like:
+        'alphafold/alphafold_iteration/structure_module/...'
+        'alphafold/alphafold_iteration/predicted_lddt/...'
+        'alphafold/alphafold_iteration/predicted_aligned_error/...'
+    The standalone hk.transform expects:
+        'structure_module/...'
+        'predicted_lddt/...'
+        'predicted_aligned_error/...'
+    This function strips the 'alphafold/alphafold_iteration/' prefix
+    and keeps only the modules needed for SM + heads.
+    Args:
+        full_params: complete Haiku params dict from RunModel.
+    Returns:
+        sm_params: stripped params for standalone SM + heads.
+    """
+    # The prefix used by AlphaFold's module hierarchy
+    PREFIX = 'alphafold/alphafold_iteration/'
+    # Module prefixes we need for SM + confidence heads
+    KEEP_MODULES = (
+        'structure_module',
+        'predicted_lddt',
+        'predicted_aligned_error',
+        'experimentally_resolved',  # in case it exists
+    )
+    sm_params = {}
+    for key, value in full_params.items():
+        # Strip the alphafold iteration prefix
+        if key.startswith(PREFIX):
+            stripped = key[len(PREFIX):]
+        else:
+            stripped = key
+        # Keep only structure module and head params
+        module_name = stripped.split('/')[0]
+        if module_name in KEEP_MODULES:
+            sm_params[stripped] = value
+    if not sm_params:
+        raise ValueError(
+            f"No structure_module params found. Full param keys sample: "
+            f"{list(full_params.keys())[:5]}. Expected prefix: '{PREFIX}'")
+    print(f"[Sampling] Extracted {len(sm_params)} param groups for SM + heads "
+          f"from {len(full_params)} total")
+    return sm_params
+
+"""
+sampling_utils.py — PATCH: Fix Haiku parameter mismatch + exception handling
+=============================================================================
+The full AlphaFold model's Haiku params have keys prefixed with
+'alphafold/alphafold_iteration/' (e.g. 'alphafold/alphafold_iteration/
+structure_module/single_layer_norm'). When we create a standalone
+hk.transform for just the structure module + heads, the module names
+start from root (e.g. 'structure_module/single_layer_norm'). This
+causes "Unable to retrieve parameter" errors.
+FIX: Extract sub-params and strip the prefix before calling sm_apply.
+Also fixes:
+  - jax.errors.JaxRuntimeError (doesn't exist in older JAX versions)
+  - Radius unification between Task 2 and Task 4
+"""
+import haiku as hk
+import jax
+import jax.numpy as jnp
+import numpy as np
+from typing import Dict, Any
+# ═════════════════════════════════════════════════════════════════════
+# NEW FUNCTION: Extract structure module + head params from full model
+# Add this before run_sampling_loop
+# ═════════════════════════════════════════════════════════════════════
+def extract_sm_params(full_params: dict) -> dict:
+    """Extract structure module + confidence head params from full model.
+    The full model's Haiku params have keys like:
+        'alphafold/alphafold_iteration/structure_module/...'
+        'alphafold/alphafold_iteration/predicted_lddt/...'
+        'alphafold/alphafold_iteration/predicted_aligned_error/...'
+    The standalone hk.transform expects:
+        'structure_module/...'
+        'predicted_lddt/...'
+        'predicted_aligned_error/...'
+    This function strips the 'alphafold/alphafold_iteration/' prefix
+    and keeps only the modules needed for SM + heads.
+    Args:
+        full_params: complete Haiku params dict from RunModel.
+    Returns:
+        sm_params: stripped params for standalone SM + heads.
+    """
+    # The prefix used by AlphaFold's module hierarchy
+    PREFIX = 'alphafold/alphafold_iteration/'
+    # Module prefixes we need for SM + confidence heads
+    KEEP_MODULES = (
+        'structure_module',
+        'predicted_lddt',
+        'predicted_aligned_error',
+        'experimentally_resolved',  # in case it exists
+    )
+    sm_params = {}
+    for key, value in full_params.items():
+        # Strip the alphafold iteration prefix
+        if key.startswith(PREFIX):
+            stripped = key[len(PREFIX):]
+        else:
+            stripped = key
+        # Keep only structure module and head params
+        module_name = stripped.split('/')[0]
+        if module_name in KEEP_MODULES:
+            sm_params[stripped] = value
+    if not sm_params:
+        raise ValueError(
+            f"No structure_module params found. Full param keys sample: "
+            f"{list(full_params.keys())[:5]}. Expected prefix: '{PREFIX}'")
+    print(f"[Sampling] Extracted {len(sm_params)} param groups for SM + heads "
+          f"from {len(full_params)} total")
+    return sm_params
+
 def run_sampling_loop(
         params: dict,
         config: Any,
@@ -296,7 +420,7 @@ def run_sampling_loop(
     """Full sampling pipeline: generate masks → run SM → collect distributions.
     For memory efficiency, processes samples in chunks when n_samples is large.
     Args:
-        params: Haiku model parameters.
+        params: Haiku model parameters (full model).
         config: full model config.
         cached_single: [N_res, c_s] from evoformer.
         cached_pair: [N_res, N_res, c_z] from evoformer.
@@ -309,37 +433,29 @@ def run_sampling_loop(
         sampling_fraction_evo: fraction for pair repr masking.
         base_seed: RNG seed.
     Returns:
-        dict with:
-          all_coords:     [n_samples, N_res, 37, 3]
-          all_plddt:      [n_samples, N_res]
-          all_pae:        [n_samples, N_res, N_res]
-          plddt_mean:     [N_res]
-          plddt_std:      [N_res]
-          coord_rmsf:     [N_res]  per-residue CA RMSF
-          sampling_freq:  [N_res]  how often each residue was masked
+        dict with all_coords, all_plddt, all_pae, statistics.
     """
-    import haiku as hk
+    from alphafold.model import modules as mod
+    from alphafold.model import folding
     # Phase B: compute residue sets
     residue_sets = compute_residue_sets(mask_array, ig_positions, radius)
     mask_set_jax = jnp.array(residue_sets['mask_set'])
     sampleable_jax = jnp.array(residue_sets['sampleable'])
     n_res = cached_single.shape[0]
     # Determine memory-safe chunk size
-    # Heuristic: pair repr is [N, N, c_z], keep chunks small enough
     c_z = cached_pair.shape[-1]
     mem_per_sample_mb = (n_res * n_res * c_z * 4) / (1024 ** 2)
-    max_chunk_mb = 2048  # 2 GB target per chunk
+    max_chunk_mb = 2048
     chunk_size = max(1, min(n_samples, int(max_chunk_mb / max(mem_per_sample_mb, 1))))
     print(f"[Sampling] N_res={n_res}, c_z={c_z}, chunk_size={chunk_size}, "
           f"n_samples={n_samples}")
-    # Build structure-only forward function
-    # We use hk.transform to create a function that runs only SM + heads
+    # ── FIX 1: Extract and remap params for standalone SM ──
+    sm_params = extract_sm_params(params)
+    # ── Build structure-only forward function ──
+    c_model = config.model
+    gc = c_model.global_config
     def _sm_forward(masked_single, masked_pair, batch_inner):
-        """Haiku-transformable structure module forward."""
-        from alphafold.model import modules as mod
-        from alphafold.model import folding
-        c_model = config.model
-        gc = c_model.global_config
+        """Haiku-transformable SM + heads forward pass."""
         representations = {'single': masked_single, 'pair': masked_pair}
         # Structure module
         sm = folding.StructureModule(c_model.heads['structure_module'], gc)
@@ -352,7 +468,7 @@ def run_sampling_loop(
             'final_atom_mask': sm_ret['final_atom_mask'],
         }
         # pLDDT head
-        if c_model.heads.get('predicted_lddt.weight', 0.0):
+        if 'predicted_lddt' in c_model.heads:
             lddt_head = mod.PredictedLDDTHead(
                 c_model.heads['predicted_lddt'], gc, name='predicted_lddt')
             result['plddt_logits'] = lddt_head(representations, batch_inner, False)['logits']
@@ -364,6 +480,7 @@ def run_sampling_loop(
             result['pae_logits'] = pae_head(representations, batch_inner, False)['logits']
         return result
     sm_transformed = hk.transform(_sm_forward)
+    # ### FIX 1 continued: use sm_params (stripped prefix), not full params
     sm_apply = jax.jit(sm_transformed.apply)
     # Collect results
     all_coords_list = []
@@ -380,43 +497,42 @@ def run_sampling_loop(
             sampling_fraction_ig, sampling_fraction_evo,
             current_chunk,
             base_seed=base_seed + n_processed)
-        # Track sampling frequency (which residues got zeroed)
+        # Track sampling frequency
         for si in range(current_chunk):
-            # A residue was "masked" in a sample if its single repr is all-zero
-            zeroed = jnp.all(chunk_singles[si] == 0, axis=-1)  # [N_res]
+            zeroed = jnp.all(chunk_singles[si] == 0, axis=-1)
             sampling_freq += np.array(zeroed, dtype=np.float32)
         # Run structure module for each sample in the chunk
-        # Attempt vmap if chunk fits in memory
         try:
             def _run_one(single_pair):
                 """Run SM on one (single, pair) sample."""
                 s, p = single_pair
-                return sm_apply(params, jax.random.PRNGKey(0), s, p, batch)
+                # ### FIX 1: pass sm_params instead of full params
+                return sm_apply(sm_params, jax.random.PRNGKey(0), s, p, batch)
             batched_run = jax.vmap(_run_one)
             chunk_results = batched_run((chunk_singles, chunk_pairs))
             # Extract numpy arrays
             all_coords_list.append(np.array(chunk_results['final_atom_positions']))
             if 'plddt_logits' in chunk_results:
-                # Convert logits to pLDDT scores
                 plddt_probs = jax.nn.softmax(chunk_results['plddt_logits'], axis=-1)
-                # Bins: 0..99 in 50 bins → weighted sum
                 n_bins = plddt_probs.shape[-1]
                 bin_centers = jnp.arange(0.5, n_bins, 1.0) / n_bins * 100.0
                 plddt_scores = jnp.sum(plddt_probs * bin_centers[None, None, :], axis=-1)
                 all_plddt_list.append(np.array(plddt_scores))
             if 'pae_logits' in chunk_results:
-                # Convert PAE logits to expected error
                 pae_probs = jax.nn.softmax(chunk_results['pae_logits'], axis=-1)
                 n_pae_bins = pae_probs.shape[-1]
-                pae_bin_centers = jnp.arange(0.5, n_pae_bins) * 0.5  # 0.5 Å bins
+                pae_bin_centers = jnp.arange(0.5, n_pae_bins) * 0.5
                 pae_scores = jnp.sum(pae_probs * pae_bin_centers[None, None, None, :], axis=-1)
                 all_pae_list.append(np.array(pae_scores))
-        except (jax.errors.JaxRuntimeError, MemoryError):
-            # Fallback: sequential processing if vmap OOMs
-            print(f"[Sampling] vmap OOM at chunk_size={current_chunk}, falling back to sequential")
+        # ### FIX 2: catch RuntimeError (works on all JAX versions) instead of
+        # jax.errors.JaxRuntimeError (only exists in newer JAX)
+        except (RuntimeError, MemoryError) as e:
+            print(f"[Sampling] vmap failed at chunk_size={current_chunk}, "
+                  f"falling back to sequential. Error: {type(e).__name__}")
             for si in range(current_chunk):
+                # ### FIX 1: pass sm_params here too
                 result_i = sm_apply(
-                    params, jax.random.PRNGKey(si),
+                    sm_params, jax.random.PRNGKey(si),
                     chunk_singles[si], chunk_pairs[si], batch)
                 all_coords_list.append(np.array(result_i['final_atom_positions'])[None])
                 if 'plddt_logits' in result_i:
@@ -434,27 +550,26 @@ def run_sampling_loop(
         n_processed += current_chunk
         print(f"[Sampling] Processed {n_processed}/{n_samples} samples")
     # ── Phase E: Distribution Collection ──
-    all_coords = np.concatenate(all_coords_list, axis=0)    # [n_samples, N, 37, 3]
+    all_coords = np.concatenate(all_coords_list, axis=0)
     output = {'all_coords': all_coords, 'sampling_freq': sampling_freq}
     if all_plddt_list:
-        all_plddt = np.concatenate(all_plddt_list, axis=0)  # [n_samples, N]
+        all_plddt = np.concatenate(all_plddt_list, axis=0)
         output['all_plddt'] = all_plddt
         output['plddt_mean'] = np.mean(all_plddt, axis=0)
         output['plddt_std'] = np.std(all_plddt, axis=0)
-        output['plddt_p5'] = np.percentile(all_plddt, 5, axis=0)
-        output['plddt_p95'] = np.percentile(all_plddt, 95, axis=0)
     if all_pae_list:
-        all_pae = np.concatenate(all_pae_list, axis=0)      # [n_samples, N, N]
+        all_pae = np.concatenate(all_pae_list, axis=0)
         output['all_pae'] = all_pae
         output['pae_mean'] = np.mean(all_pae, axis=0)
-        output['pae_std'] = np.std(all_pae, axis=0)
-    # Coordinate RMSF: per-residue CA positional fluctuation
-    ca_coords = all_coords[:, :, CA_IDX, :]                 # [n_samples, N, 3]
-    ca_mean = np.mean(ca_coords, axis=0, keepdims=True)     # [1, N, 3]
-    ca_deviations = ca_coords - ca_mean                      # [n_samples, N, 3]
-    rmsf = np.sqrt(np.mean(np.sum(ca_deviations ** 2, axis=-1), axis=0))  # [N]
-    output['coord_rmsf'] = rmsf
+    # Coordinate RMSF: per-residue CA position standard deviation
+    from ig_pipeline import CA_IDX
+    all_ca = all_coords[:, :, CA_IDX, :]  # [n_samples, N_res, 3]
+    ca_mean = np.mean(all_ca, axis=0)     # [N_res, 3]
+    ca_dev = all_ca - ca_mean[None, :, :] # [n_samples, N_res, 3]
+    coord_rmsf = np.sqrt(np.mean(np.sum(ca_dev ** 2, axis=-1), axis=0))
+    output['coord_rmsf'] = coord_rmsf
     return output
+
 # ─────────────────────────────────────────────────────────────────────
 # Output Writers
 # ─────────────────────────────────────────────────────────────────────

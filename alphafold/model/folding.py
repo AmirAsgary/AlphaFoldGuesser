@@ -913,6 +913,7 @@ def supervised_chi_loss(ret, batch, value, config):
 
 
 def generate_new_affine(sequence_mask):
+  print("DEBUUUUUUUG", sequence_mask.shape)
   num_residues, _ = sequence_mask.shape
   quaternion = jnp.tile(
       jnp.reshape(jnp.asarray([1., 0., 0., 0.]), [1, 4]),

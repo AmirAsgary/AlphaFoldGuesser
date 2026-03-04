@@ -8,9 +8,28 @@ Instructions:
   1. Add the argparse block below AFTER the existing parser.add_argument() calls.
   2. Replace the per-target loop body with the updated version below.
 """
+import json
+import os
+import pandas as pd
+import numpy as np
 # ═════════════════════════════════════════════════════════════════════
 # SECTION 1: New CLI arguments (add after existing parser.add_argument calls)
 # ═════════════════════════════════════════════════════════════════════
+def _has_valid_template_pdb_dict(targetl) -> bool:
+    """Check if targetl row has a valid template_pdb_dict pointing to a file.
+    Handles: missing column, NaN value, non-existent file.
+    Args:
+        targetl: pandas row (from iterrows or itertuples).
+    Returns:
+        True if template_pdb_dict points to a valid, existing file.
+    """
+    val = getattr(targetl, 'template_pdb_dict', None)
+    if val is None:
+        return False
+    if isinstance(val, float) and pd.isna(val):
+        return False
+    return os.path.isfile(str(val))
+
 def add_ig_pipeline_args(parser):
     """Register all IG pipeline CLI arguments on the given argparse parser.
     Call this right after creating the parser and before parse_args().
@@ -233,21 +252,19 @@ def process_target_with_ig_pipeline(
               f"stable(+1)={np.sum(mask_array==1)}, "
               f"default(0)={np.sum(mask_array==0)}")
     # ── Legacy IG pipeline (backward compat) ──
-    elif not args.no_initial_guess and hasattr(targetl, 'template_pdb_dict'):
+    elif not args.no_initial_guess and _has_valid_template_pdb_dict(targetl):
         print("[IG Pipeline] Using legacy template_pdb_dict IG input")
-        template_pdb_dict_path = targetl.template_pdb_dict
+        template_pdb_dict_path = str(targetl.template_pdb_dict)
         with open(template_pdb_dict_path, 'r') as f:
             template_pdb_dict = json.load(f)
         template_pdb_list = template_pdb_dict['template_path']
         aln = (template_pdb_dict['aln_target'][0],
-               template_pdb_dict['aln_template'][0])
+            template_pdb_dict['aln_template'][0])
         anchors = template_pdb_dict['target_anchors'][0]
         peptide_seq = template_pdb_dict['aln_P'][0][0].replace('-', '')
-        # Check for mask overlay on legacy mode
+        # Mask overlay on legacy mode (unchanged)
         mask_array_for_legacy = None
         if ig_config is not None and (ig_config['mask_residues'] or ig_config['ig_mask_npy']):
-            # Build mask from legacy structure
-            # We need structure to compute mask; parse the template PDB
             struct_out = parse_structure_input(pdb_path=template_pdb_list[0])
             mask_array_for_legacy = generate_mask_from_structure(
                 struct_out['all_positions'], struct_out['chain_ids'],
@@ -264,6 +281,12 @@ def process_target_with_ig_pipeline(
             anchors=anchors,
             peptide_seq=peptide_seq,
             ig_mask=mask_array_for_legacy)
+    elif not args.no_initial_guess:
+        # No new-style IG, no legacy dict — warn and proceed without IG
+        print("[IG Pipeline] WARNING: --no_initial_guess not set but no IG "
+            "input found (no --ig_pdb, no template_pdb_dict). "
+            "Proceeding without initial guess.")
+    # ig_result stays None → run_alphafold_prediction_v2 handles gracefully
     # ── Run prediction (v2 with full pipeline) ──
     all_metrics = run_alphafold_prediction_v2(
         query_sequence=query_sequence,

@@ -49,9 +49,10 @@ parser.add_argument('--outfile_prefix',
 parser.add_argument('--final_outfile_prefix',
                     help='Prefix that will be prepended to the final output '
                     'tsv filename')
-parser.add_argument('--targets', required=True, help='File listing the targets to '
-                    'be modeled. See description of file format in the github '
-                    'README and also examples in the examples/*/*tsv')
+parser.add_argument('--targets', default=None,
+    help='File listing the targets to be modeled. See description of file '
+         'format in the github README and examples in examples/*/*tsv. '
+         'If not provided, use --template_pdb to auto-generate.')
 parser.add_argument('--data_dir', help='Location of AlphaFold params/ folder')
 
 parser.add_argument('--model_names', type=str, nargs='*', default=['model_2_ptm'])
@@ -62,6 +63,24 @@ parser.add_argument('--ignore_identities', action='store_true',
                     help='Ignore the sequence identities column in the templates '
                     'alignment files. Useful when modeling many different peptides '
                     'using the same alignment file.')
+# --- Auto-generation args (replaces manual targets/alignment TSV creation) ---
+auto_group = parser.add_argument_group(
+    'Auto-generate inputs',
+    'When --template_pdb is provided, alignment and targets TSV files are '
+    'auto-generated in --output_dir. This replaces manual file creation. '
+    'If --targets is also provided, --targets takes precedence.')
+auto_group.add_argument('--template_pdb', type=str, default=None,
+    help='Path to template PDB file. When provided without --targets, '
+         'auto-generates alignment and targets TSV files. The template '
+         'is the same protein used for conformation sampling.')
+auto_group.add_argument('--target_chainseq', type=str, default=None,
+    help='Target sequence with "/" chain separators, e.g. "MKTA.../AVSL...". '
+         'If omitted, inferred from --template_pdb (identity mode).')
+auto_group.add_argument('--targetid', type=str, default=None,
+    help='Target identifier string. If omitted, derived from PDB filename.')
+auto_group.add_argument('--output_dir', type=str, default=None,
+    help='Output directory for auto-generated files and predictions. '
+         'Required when using --template_pdb without --targets.')
 parser.add_argument('--no_pdbs', action='store_true', help='Dont write out pdbs')
 parser.add_argument('--terse', action='store_true', help='Dont write out pdbs or '
                     'matrices with alphafold confidence values')
@@ -87,7 +106,25 @@ import numpy as np
 import pandas as pd
 import predict_utils
 
-targets = pd.read_table(args.targets) #DEBUG
+from input_generator import auto_generate_inputs
+
+# --- Resolve targets file: manual or auto-generated ---
+if args.targets is not None:
+    # User provided a targets TSV directly — use as-is (backward compat)
+    targets_file = args.targets
+elif args.template_pdb is not None:
+    # Auto-generate from template PDB
+    assert args.output_dir is not None, (
+        "--output_dir is required when using --template_pdb without --targets")
+    targets_file, _ = auto_generate_inputs(
+        template_pdb_path=args.template_pdb,
+        output_dir=args.output_dir,
+        target_chainseq=args.target_chainseq,  # None → infer from PDB
+        targetid=args.targetid)                 # None → derive from filename
+else:
+    parser.error("Either --targets or --template_pdb must be provided.")
+# Read the targets TSV (works for both manual and auto-generated)
+targets = pd.read_table(targets_file)
 lens = [len(x.target_chainseq.replace('/',''))
         for x in targets.itertuples()]
 crop_size = max(lens)
@@ -121,12 +158,18 @@ for counter, targetl in targets.iterrows():
     print('START:', counter, 'of', targets.shape[0])
 
     alignfile = targetl.templates_alignfile
-    if not args.no_initial_guess: # added by Amir for initial guess condition and getting dict from input tsv
-        template_pdb_dict = targetl.template_pdb_dict
-        with open(template_pdb_dict, 'r') as f:
-            template_pdb_dict = json.load(f)
-    else: # added by Amir for initial guess condition and getting dict from input tsv
-        template_pdb_dict = None
+    emplate_pdb_dict = None
+    if not args.no_initial_guess:
+        # template_pdb_dict is legacy (pMHC anchors/alignment JSON).
+        # Only load if the column exists AND has a non-empty value.
+        if (hasattr(targetl, 'template_pdb_dict')
+                and pd.notna(getattr(targetl, 'template_pdb_dict', None))):
+            dict_path = targetl.template_pdb_dict
+            if os.path.isfile(dict_path):
+                with open(dict_path, 'r') as f:
+                    template_pdb_dict = json.load(f)
+            else:
+                print(f"[WARNING] template_pdb_dict path not found: {dict_path}, skipping.")
             
 
     print(alignfile)
@@ -135,12 +178,17 @@ for counter, targetl in targets.iterrows():
     query_chainseq = targetl.target_chainseq
     if 'outfile_prefix' in targetl:
         outfile_prefix = targetl.outfile_prefix
-    else:
-        assert args.outfile_prefix is not None
+    elif args.outfile_prefix is not None:
         if 'targetid' in targetl:
-            outfile_prefix = args.outfile_prefix+targetl.targetid
+            outfile_prefix = args.outfile_prefix + targetl.targetid
         else:
             outfile_prefix = f'{args.outfile_prefix}_T{counter}'
+    elif args.output_dir is not None:
+        # Derive from output_dir + targetid
+        tid = getattr(targetl, 'targetid', f'T{counter}')
+        outfile_prefix = os.path.join(args.output_dir, tid)
+    else:
+        raise ValueError("No output prefix: provide --outfile_prefix or --output_dir.")
 
     query_sequence = query_chainseq.replace('/','')
     num_res = len(query_sequence)

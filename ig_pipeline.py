@@ -16,6 +16,7 @@ from typing import Optional, Tuple, List, Union, Dict
 from alphafold.common import residue_constants
 from Bio import PDB
 from Bio.PDB import PDBParser, is_aa, Polypeptide
+from predict_utils import load_pdb_coords, fill_afold_coords
 # ─────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────
@@ -54,10 +55,16 @@ def _estimate_cb_from_ca(ca_coords: np.ndarray, n_res: int) -> np.ndarray:
     noise = rng.uniform(-0.05, 0.05, size=(n_res, 3)).astype(np.float32)
     cb_coords = ca_coords + canonical_offset[None, :] + noise
     return cb_coords
+
 def _parse_pdb_multichain(pdb_path: str) -> Tuple[
     np.ndarray, np.ndarray, str, np.ndarray, np.ndarray]:
     """Parse a multi-chain PDB into AF2-compatible arrays.
-    Handles altLoc (prefer ' ', 'A', '1'), MSE→MET, insertion codes.
+    Uses predict_utils.load_pdb_coords to guarantee residue counts are
+    identical to create_single_template_features(). This is critical:
+    the alignment TSV, template features, and IG mask must all agree
+    on the exact same residue set.
+    Handles altLoc (prefer ' ', 'A', '1'), MSE→MET, HETATM filtering,
+    chain breaks — all inherited from load_pdb_coords.
     Args:
         pdb_path: path to the PDB file.
     Returns:
@@ -65,61 +72,33 @@ def _parse_pdb_multichain(pdb_path: str) -> Tuple[
         all_positions_mask: [N_res, 37] presence mask.
         sequence: one-letter sequence (all chains concatenated).
         chain_ids: [N_res] chain ID per residue (str array).
-        residue_indices: [N_res] original PDB residue numbers.
+        residue_indices: [N_res] original PDB residue numbers (int array).
     """
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("ig", pdb_path)
-    model = list(structure.get_models())[0]
-    # Collect per-residue data across all chains, preserving order
-    positions_list = []
-    mask_list = []
+    # Use the canonical PDB reader from predict_utils
+    chains, all_resids, all_coords, all_name1s = load_pdb_coords(
+        pdb_path, allow_chainbreaks=True, allow_skipped_lines=True)
+    # Build atom37 coordinate arrays (same function used by template features)
+    all_positions, all_positions_mask = fill_afold_coords(
+        chains, all_resids, all_coords)
+    # Build sequence, chain_ids, residue_indices arrays in residue order
     seq_chars = []
     chain_id_list = []
     resindex_list = []
-    for chain in model:
-        for residue in chain:
-            # Skip HETATMs that aren't MSE
-            het_flag = residue.id[0]
-            if het_flag != ' ' and residue.resname != 'MSE':
-                continue
-            # Skip water
-            if residue.resname in ('HOH', 'WAT'):
-                continue
-            # Resolve amino acid identity
-            resname = residue.resname
-            if resname == 'MSE':
-                resname = 'MET'
-            aa_one = THREE_TO_ONE.get(resname, 'X')
-            # Build atom37 arrays for this residue
-            pos = np.zeros([ATOM_TYPE_NUM, 3], dtype=np.float32)
-            mask = np.zeros([ATOM_TYPE_NUM], dtype=np.float32)
-            for atom in residue:
-                # Handle altLoc: prefer ' ', then 'A', then '1'
-                altloc = atom.get_altloc()
-                if altloc not in (' ', '', 'A', '1'):
-                    continue
-                name = atom.get_name()
-                # MSE: SE → SD position
-                if name == 'SE' and residue.resname == 'MSE':
-                    name = 'SD'
-                if name in residue_constants.atom_order:
-                    idx = residue_constants.atom_order[name]
-                    pos[idx] = atom.get_vector().get_array()
-                    mask[idx] = 1.0
-            # Skip residues with no recognized atoms
-            if mask.sum() < 0.5:
-                continue
-            positions_list.append(pos)
-            mask_list.append(mask)
-            seq_chars.append(aa_one)
-            chain_id_list.append(chain.id)
-            resindex_list.append(residue.id[1])
-    all_positions = np.stack(positions_list, axis=0)       # [N, 37, 3]
-    all_positions_mask = np.stack(mask_list, axis=0)       # [N, 37]
+    for ch in chains:
+        for r in all_resids[ch]:
+            seq_chars.append(all_name1s[ch][r])
+            chain_id_list.append(ch)
+            # Extract numeric part of resid (handles insertion codes like ' 123A')
+            resid_str = r.strip()
+            # PDB resid field is columns 22:27, may contain insertion code
+            # Extract leading integer, default to 0 if unparseable
+            num_part = ''.join(c for c in resid_str if c.isdigit() or c == '-')
+            resindex_list.append(int(num_part) if num_part else 0)
     sequence = ''.join(seq_chars)
-    chain_ids = np.array(chain_id_list, dtype='U1')        # [N]
-    residue_indices = np.array(resindex_list, dtype=np.int32)  # [N]
+    chain_ids = np.array(chain_id_list, dtype='U4')  # U4 for multi-char chain IDs
+    residue_indices = np.array(resindex_list, dtype=np.int32)
     return all_positions, all_positions_mask, sequence, chain_ids, residue_indices
+
 def _apply_atom_filter(all_positions: np.ndarray,
                        all_positions_mask: np.ndarray,
                        sequence: str,
@@ -159,6 +138,7 @@ def _apply_atom_filter(all_positions: np.ndarray,
         all_positions[place, CB_IDX, :] = cb_est[place]
         all_positions_mask[place, CB_IDX] = 1.0
     return all_positions, all_positions_mask
+
 def _coords_array_to_atom37(coords: np.ndarray,
                             sequence: str,
                             use_only_CA: bool,
@@ -589,3 +569,5 @@ def initial_guess_features_legacy(
         legacy_mask = legacy_anchors_to_mask(n_res, pep_len, anchors)
         all_positions = apply_ig_mask(all_positions, legacy_mask)
     return parse_initial_guess(all_positions)
+
+
