@@ -144,6 +144,7 @@ def predict_structure_v2(
         sampling_fraction_ig: float = 0.5,
         sampling_fraction_evo: float = 0.3,
         base_seed: int = 42,
+        sampling_dropout_rate: float = 0.1,
 ):
     """Predict structure with full IG pipeline support (Tasks 1-4).
     Args:
@@ -219,7 +220,8 @@ def predict_structure_v2(
                     n_samples=n_times_sampling,
                     sampling_fraction_ig=sampling_fraction_ig,
                     sampling_fraction_evo=sampling_fraction_evo,
-                    base_seed=base_seed)
+                    base_seed=base_seed,
+                    sampling_dropout_rate=sampling_dropout_rate)
                 # Save sampling results
                 sampling_prefix = f'{prefix}_{model_name}'
                 save_sampling_results(sampling_output, sampling_prefix)
@@ -300,6 +302,7 @@ def run_alphafold_prediction_v2(
         sampling_fraction_ig: float = 0.5,
         sampling_fraction_evo: float = 0.3,
         base_seed: int = 42,
+        sampling_dropout_rate: float = 0.1,
 ):
     """Top-level prediction function with full IG pipeline support.
     Builds the AF2 feature dict, applies chain breaks, and delegates
@@ -362,5 +365,6 @@ def run_alphafold_prediction_v2(
         radius=radius,
         sampling_fraction_ig=sampling_fraction_ig,
         sampling_fraction_evo=sampling_fraction_evo,
-        base_seed=base_seed)
+        base_seed=base_seed,
+        sampling_dropout_rate=sampling_dropout_rate)
     return all_metrics

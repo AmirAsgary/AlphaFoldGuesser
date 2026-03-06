@@ -94,6 +94,8 @@ def add_ig_pipeline_args(parser):
         help='Fraction of sampleable residues zeroed in pair repr (default: 0.3).')
     samp_group.add_argument('--sampling_seed', type=int, default=42,
         help='Base random seed for sampling (default: 42).')
+    samp_group.add_argument('--sampling_dropout_rate', type=float, default=0.1,
+        help='dropout rate on evoformer final layer on sampled and masked tokens.')
     return parser
 # ═════════════════════════════════════════════════════════════════════
 # SECTION 2: IG pipeline setup function (call once before the target loop)
@@ -132,6 +134,7 @@ def setup_ig_pipeline(args):
         'sampling_fraction_ig': args.sampling_fraction_IG,
         'sampling_fraction_evo': args.sampling_fraction_evo,
         'base_seed': args.sampling_seed,
+        'sampling_dropout_rate': args.sampling_dropout_rate,
     }
     return config
 # ═════════════════════════════════════════════════════════════════════
@@ -308,7 +311,8 @@ def process_target_with_ig_pipeline(
         radius=ig_config['radius'] if ig_config else 8.0,
         sampling_fraction_ig=ig_config['sampling_fraction_ig'] if ig_config else 0.5,
         sampling_fraction_evo=ig_config['sampling_fraction_evo'] if ig_config else 0.3,
-        base_seed=ig_config['base_seed'] if ig_config else 42)
+        base_seed=ig_config['base_seed'] if ig_config else 42,
+        sampling_dropout_rate=ig_config['sampling_dropout_rate'] if ig_config else 0.1)
     return all_metrics
 # ═════════════════════════════════════════════════════════════════════
 # SECTION 4: Example integration snippet (shows how to patch run_prediction.py)

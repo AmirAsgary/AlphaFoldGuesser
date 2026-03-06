@@ -1,5 +1,9 @@
 af_params/
 *.zip
 *tmp*
-
+*output*
+*cache*
+*example*
+*.pyc*
+*pycache*
 

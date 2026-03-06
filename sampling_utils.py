@@ -96,6 +96,7 @@ def _random_subset(key: jnp.ndarray,
     # Select: sampleable AND random < fraction
     selected = sampleable_bool & (rand_vals < fraction)
     return selected
+## ── Hardcoded dropout rate for sampling-phase perturbation ──
 def generate_masked_representations_single_sample(
         cached_single: jnp.ndarray,
         cached_pair: jnp.ndarray,
@@ -104,49 +105,70 @@ def generate_masked_representations_single_sample(
         sampling_fraction_ig: float,
         sampling_fraction_evo: float,
         key_ig: jnp.ndarray,
-        key_evo: jnp.ndarray
+        key_evo: jnp.ndarray,
+        sampling_dropout_rate: float,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Generate one masked (single, pair) representation sample. Pure JAX.
+    """Generate one masked (single, pair) representation sample.
+    For masked/sampled residues, applies channel-wise dropout instead of
+    zeroing. Dropout is in-distribution for the structure module (AF2
+    uses dropout during training), so the SM interprets partially-dropped
+    channels as noisy-but-plausible signal rather than the pathological
+    all-zero case.
+    Stable and unselected residues pass through unchanged.
     Args:
         cached_single: [N_res, c_s] cached evoformer single representation.
         cached_pair: [N_res, N_res, c_z] cached evoformer pair representation.
-        mask_set: [N_res] bool, always-mask residues.
-        sampleable: [N_res] bool, stochastically maskable residues.
-        sampling_fraction_ig: fraction of sampleable to zero in single repr.
-        sampling_fraction_evo: fraction of sampleable to zero in pair repr.
+        mask_set: [N_res] bool, always-perturbed residues (token -1).
+        sampleable: [N_res] bool, stochastically perturbed (token -2 + eligible).
+        sampling_fraction_ig: fraction of sampleable to perturb in single repr.
+        sampling_fraction_evo: fraction of sampleable to perturb in pair repr.
         key_ig: PRNG key for single-repr sampling.
         key_evo: PRNG key for pair-repr sampling.
     Returns:
         masked_single: [N_res, c_s]
         masked_pair: [N_res, N_res, c_z]
     """
-    n_res = cached_single.shape[0]
-    # ── Single representation masking ──
-    # Always zero mask_set, plus random subset of sampleable
-    ig_sample = _random_subset(key_ig, sampleable, sampling_fraction_ig)
-    single_zero = mask_set | ig_sample                        # [N_res] bool
-    # Broadcast: [N_res, 1] * [N_res, c_s]
-    single_keep = (~single_zero).astype(jnp.float32)[:, None]
-    masked_single = cached_single * single_keep
-    # ── Pair representation masking ──
-    evo_sample = _random_subset(key_evo, sampleable, sampling_fraction_evo)
-    pair_zero = mask_set | evo_sample                         # [N_res] bool
-    # Zero out rows and columns for pair repr
-    # pair_keep_row: [N_res, 1, 1], pair_keep_col: [1, N_res, 1]
-    keep_1d = (~pair_zero).astype(jnp.float32)
-    pair_keep = keep_1d[:, None, None] * keep_1d[None, :, None]  # [N, N, 1]
-    # Broadcast-multiply: only keep if BOTH row and col are not zeroed
-    # Actually per spec: zero entire row/col, so use min (AND logic)
-    row_keep = keep_1d[:, None]    # [N_res, 1]
-    col_keep = keep_1d[None, :]    # [1, N_res]
-    # A pair entry is zeroed if EITHER its row OR its column residue is zeroed
-    pair_mask_2d = (row_keep * col_keep)[:, :, None]  # [N, N, 1]
-    masked_pair = cached_pair * pair_mask_2d
+    rate = sampling_dropout_rate
+    keep_rate = 1.0 - rate
+    n_res, c_s = cached_single.shape
+    c_z = cached_pair.shape[-1]
+    # ── Single representation: dropout on selected residues ──
+    # Split key: one for subset selection, one for dropout pattern
+    key_ig_sel, key_ig_drop = jax.random.split(key_ig)
+    ig_sample = _random_subset(key_ig_sel, sampleable, sampling_fraction_ig)
+    single_affected = mask_set | ig_sample  # [N_res] bool
+    # Channel-wise dropout mask: [N_res, c_s], 1=keep 0=drop
+    single_drop_mask = jax.random.bernoulli(
+        key_ig_drop, keep_rate, shape=(n_res, c_s)
+    ).astype(jnp.float32) / keep_rate  # scale to preserve expected magnitude
+    # Apply dropout only to affected residues; others pass through unchanged
+    affected_1d = single_affected.astype(jnp.float32)[:, None]  # [N_res, 1]
+    masked_single = cached_single * (
+        (1.0 - affected_1d) + affected_1d * single_drop_mask
+    )
+    # ── Pair representation: dropout on affected rows/columns ──
+    key_evo_sel, key_evo_drop = jax.random.split(key_evo)
+    evo_sample = _random_subset(key_evo_sel, sampleable, sampling_fraction_evo)
+    pair_affected = mask_set | evo_sample  # [N_res] bool
+    # Entry [i,j] is affected if EITHER i or j is in pair_affected
+    keep_1d = (~pair_affected).astype(jnp.float32)
+    pair_unaffected_2d = keep_1d[:, None] * keep_1d[None, :]  # [N, N]
+    pair_affected_2d = 1.0 - pair_unaffected_2d  # [N, N]
+    # Channel-wise dropout mask: [N_res, N_res, c_z]
+    pair_drop_mask = jax.random.bernoulli(
+        key_evo_drop, keep_rate, shape=(n_res, n_res, c_z)
+    ).astype(jnp.float32) / keep_rate
+    # Apply dropout only to affected entries; others pass through unchanged
+    masked_pair = cached_pair * (
+        pair_unaffected_2d[:, :, None] + pair_affected_2d[:, :, None] * pair_drop_mask
+    )
     return masked_single, masked_pair
+
 # Vectorized (vmap) version for batch of samples
 def _generate_single_sample_vmappable(
         carry: Tuple,
-        keys: jnp.ndarray
+        keys: jnp.ndarray,
+        sampling_dropout_rate: float,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Vmappable wrapper: takes (key_ig, key_evo) and shared carry.
     Args:
@@ -163,7 +185,7 @@ def _generate_single_sample_vmappable(
         cached_single, cached_pair,
         mask_set, sampleable,
         frac_ig, frac_evo,
-        key_ig, key_evo)
+        key_ig, key_evo, sampling_dropout_rate)
 def generate_all_masked_representations(
         cached_single: jnp.ndarray,
         cached_pair: jnp.ndarray,
@@ -172,7 +194,8 @@ def generate_all_masked_representations(
         sampling_fraction_ig: float,
         sampling_fraction_evo: float,
         n_samples: int,
-        base_seed: int = 42
+        base_seed: int = 42,
+        sampling_dropout_rate: float = 0.1,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Generate N masked representation pairs using vmap for GPU parallelism.
     Args:
@@ -199,7 +222,7 @@ def generate_all_masked_representations(
             cached_single, cached_pair,
             mask_set, sampleable,
             sampling_fraction_ig, sampling_fraction_evo,
-            key_ig, key_evo)
+            key_ig, key_evo, sampling_dropout_rate)
     # Vectorize across n_samples
     batched_fn = jax.vmap(single_sample_fn)
     all_singles, all_pairs = batched_fn(all_keys)
@@ -290,50 +313,6 @@ def build_structure_only_fn(config: Any):
 # ─────────────────────────────────────────────────────────────────────
 # Phase D (continued): Batched Structure Module over N Samples
 # ─────────────────────────────────────────────────────────────────────
-def extract_sm_params(full_params: dict) -> dict:
-    """Extract structure module + confidence head params from full model.
-    The full model's Haiku params have keys like:
-        'alphafold/alphafold_iteration/structure_module/...'
-        'alphafold/alphafold_iteration/predicted_lddt/...'
-        'alphafold/alphafold_iteration/predicted_aligned_error/...'
-    The standalone hk.transform expects:
-        'structure_module/...'
-        'predicted_lddt/...'
-        'predicted_aligned_error/...'
-    This function strips the 'alphafold/alphafold_iteration/' prefix
-    and keeps only the modules needed for SM + heads.
-    Args:
-        full_params: complete Haiku params dict from RunModel.
-    Returns:
-        sm_params: stripped params for standalone SM + heads.
-    """
-    # The prefix used by AlphaFold's module hierarchy
-    PREFIX = 'alphafold/alphafold_iteration/'
-    # Module prefixes we need for SM + confidence heads
-    KEEP_MODULES = (
-        'structure_module',
-        'predicted_lddt',
-        'predicted_aligned_error',
-        'experimentally_resolved',  # in case it exists
-    )
-    sm_params = {}
-    for key, value in full_params.items():
-        # Strip the alphafold iteration prefix
-        if key.startswith(PREFIX):
-            stripped = key[len(PREFIX):]
-        else:
-            stripped = key
-        # Keep only structure module and head params
-        module_name = stripped.split('/')[0]
-        if module_name in KEEP_MODULES:
-            sm_params[stripped] = value
-    if not sm_params:
-        raise ValueError(
-            f"No structure_module params found. Full param keys sample: "
-            f"{list(full_params.keys())[:5]}. Expected prefix: '{PREFIX}'")
-    print(f"[Sampling] Extracted {len(sm_params)} param groups for SM + heads "
-          f"from {len(full_params)} total")
-    return sm_params
 
 """
 sampling_utils.py — PATCH: Fix Haiku parameter mismatch + exception handling
@@ -349,15 +328,7 @@ Also fixes:
   - jax.errors.JaxRuntimeError (doesn't exist in older JAX versions)
   - Radius unification between Task 2 and Task 4
 """
-import haiku as hk
-import jax
-import jax.numpy as jnp
-import numpy as np
-from typing import Dict, Any
-# ═════════════════════════════════════════════════════════════════════
-# NEW FUNCTION: Extract structure module + head params from full model
-# Add this before run_sampling_loop
-# ═════════════════════════════════════════════════════════════════════
+
 def extract_sm_params(full_params: dict) -> dict:
     """Extract structure module + confidence head params from full model.
     The full model's Haiku params have keys like:
@@ -380,9 +351,9 @@ def extract_sm_params(full_params: dict) -> dict:
     # Module prefixes we need for SM + confidence heads
     KEEP_MODULES = (
         'structure_module',
-        'predicted_lddt',
-        'predicted_aligned_error',
-        'experimentally_resolved',  # in case it exists
+        'predicted_lddt_head',
+        'predicted_aligned_error_head',
+        'experimentally_resolved_head',
     )
     sm_params = {}
     for key, value in full_params.items():
@@ -415,7 +386,8 @@ def run_sampling_loop(
         n_samples: int,
         sampling_fraction_ig: float = 0.5,
         sampling_fraction_evo: float = 0.3,
-        base_seed: int = 42
+        base_seed: int = 42,
+        sampling_dropout_rate: float = 0.1,
 ) -> Dict[str, np.ndarray]:
     """Full sampling pipeline: generate masks → run SM → collect distributions.
     For memory efficiency, processes samples in chunks when n_samples is large.
@@ -437,6 +409,7 @@ def run_sampling_loop(
     """
     from alphafold.model import modules as mod
     from alphafold.model import folding
+    batch = _squeeze_batch_ensemble(batch)
     # Phase B: compute residue sets
     residue_sets = compute_residue_sets(mask_array, ig_positions, radius)
     mask_set_jax = jnp.array(residue_sets['mask_set'])
@@ -469,14 +442,11 @@ def run_sampling_loop(
         }
         # pLDDT head
         if 'predicted_lddt' in c_model.heads:
-            lddt_head = mod.PredictedLDDTHead(
-                c_model.heads['predicted_lddt'], gc, name='predicted_lddt')
+            lddt_head = mod.PredictedLDDTHead(c_model.heads['predicted_lddt'], gc)
             result['plddt_logits'] = lddt_head(representations, batch_inner, False)['logits']
         # PAE head
         if 'predicted_aligned_error' in c_model.heads:
-            pae_head = mod.PredictedAlignedErrorHead(
-                c_model.heads['predicted_aligned_error'], gc,
-                name='predicted_aligned_error')
+            pae_head = mod.PredictedAlignedErrorHead(c_model.heads['predicted_aligned_error'], gc)
             result['pae_logits'] = pae_head(representations, batch_inner, False)['logits']
         return result
     sm_transformed = hk.transform(_sm_forward)
@@ -496,7 +466,8 @@ def run_sampling_loop(
             mask_set_jax, sampleable_jax,
             sampling_fraction_ig, sampling_fraction_evo,
             current_chunk,
-            base_seed=base_seed + n_processed)
+            base_seed=base_seed + n_processed,
+            sampling_dropout_rate=sampling_dropout_rate)
         # Track sampling frequency
         for si in range(current_chunk):
             zeroed = jnp.all(chunk_singles[si] == 0, axis=-1)
@@ -639,3 +610,35 @@ def save_sampling_results(
         if key in sampling_output:
             np.save(f'{prefix}_{key}.npy', sampling_output[key])
     print(f"[Sampling] Saved sampling results → {prefix}_sampling_results.npz")
+
+
+def _squeeze_batch_ensemble(batch: dict) -> dict:
+    """Strip the leading num_ensemble dimension from processed_feature_dict.
+    AlphaFold's data pipeline produces features with shape [num_ensemble, ...].
+    During normal forward passes AlphaFoldIteration slices/averages this away
+    before features reach the structure module.  Our standalone SM call bypasses
+    that, so we must squeeze it ourselves.
+    Takes the first ensemble copy ([0]) for every array-like value whose leading
+    dim matches the detected num_ensemble.  Scalars and non-array values are
+    passed through unchanged.
+    Args:
+        batch: raw processed_feature_dict from model_runner.process_features().
+    Returns:
+        New dict with every tensor reduced to [N_res, ...] (no ensemble dim).
+    """
+    import numpy as np
+    import jax.numpy as jnp
+    # ── Detect ensemble size from 'aatype' (guaranteed present, shape=[E, N_res]) ──
+    aatype = batch.get('aatype', None)
+    if aatype is None or not hasattr(aatype, 'shape') or len(aatype.shape) < 2:
+        # Already squeezed or unexpected layout — return as-is
+        return batch
+    n_ens = aatype.shape[0]
+    squeezed = {}
+    for k, v in batch.items():
+        # Only squeeze array-like values whose first dim == num_ensemble
+        if hasattr(v, 'shape') and len(v.shape) >= 2 and v.shape[0] == n_ens:
+            squeezed[k] = v[0]
+        else:
+            squeezed[k] = v
+    return squeezed
